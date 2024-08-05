@@ -3,6 +3,7 @@
 	"speechEna":true,
 	"tiltEna":true,
 	"bleEna":true,
+	"oledEna":true,
 	"bEar":16,
 	"bVisor":9,
 	"rbSpeed":15,

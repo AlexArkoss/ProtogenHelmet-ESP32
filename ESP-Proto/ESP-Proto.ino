@@ -2,7 +2,10 @@
 // WS2812: 16 - Ears (from outer to inner, right cheek first), 17 - Blush (from top to bottom, right cheek nearest to ear first) 
 // Microphone: 35
 // Touch sensor: 27
-// Gyro: 22 - SCL, 21 - SDA
+// Gyro, OLED: 22 - SCL, 21 - SDA
+
+// ESP32, all LEDs, DAC and fan                 → wired to 5V
+// Gyro, OLED, Microphone, PM and touch sensor  → wired to 3.3V (gyro and mic with RC filter)
 
 #include <StreamUtils.h>
 #include <sstream>
@@ -13,11 +16,19 @@
 #define CONFIG_LITTLEFS_SPIFFS_COMPAT 1
 #define CONFIG_LITTLEFS_CACHE_SIZE 256
 #define SPIFFS LittleFS
-#include <LittleFS.h>
+#include <LittleFS.h>           // LEDs data library
 
-#include "SparkFunLSM6DS3.h" 
+#include "SparkFunLSM6DS3.h"    // Gyroscope library
 #include "Wire.h"
 LSM6DS3 myIMU;
+
+#include <U8g2lib.h>            // OLED Display library
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0,/* reset=*/ U8X8_PIN_NONE);
+
+#include <Adafruit_INA219.h> //edited library in this sketch (replace 0.1R with 0.03R resistor on the board)
+Adafruit_INA219 ina219;
+
+
 
 bool loadAnim(String anim, String temp);
 
@@ -172,7 +183,7 @@ AnimNowEars earsNow;
 AnimNowVisor visorNow;
 
 //--------------------------------//Config vars
-bool speechEna = false, boopEna = false, tiltEna = false, bleEna = false, instantReload = false, caliAccy = false;
+bool speechEna = false, boopEna = false, tiltEna = false, bleEna = false, oledEna = false, instantReload = false, caliAccy = false, oledInitDone = false;
 int bEar = 64, bVisor = 6, rbSpeed = 15, rbWidth = 8, spMin = 90, spMax = 130, spTrig = 1500, currentEarsFrame = 0, currentVisorFrame = 0;
 String aTilt = "confused.json", aUp = "upset.json", currentAnim = "";
 float tiltAccy = 0.8, upAccy = -0.8, neutralX = 0, neutralZ = 0;
@@ -231,6 +242,14 @@ bool loadAnim(String anim, String temp) {
   instantReload = true;
   currentVisorFrame = 0;
   currentEarsFrame = 0;
+
+  if(oledEna) {
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(0, 0, 128, 17);
+    u8g2.setDrawColor(1);
+    displayCenter(anim.substring(0,anim.length()-5),14);
+    u8g2.updateDisplayArea(0,0,16,2);
+  }
   
   return true;
 }
@@ -256,6 +275,7 @@ bool loadConfig() {
   speechEna = doc["speechEna"].as<bool>();
   tiltEna = doc["tiltEna"].as<bool>();
   bleEna = doc["bleEna"].as<bool>();
+  oledEna = doc["oledEna"].as<bool>();
   bEar = doc["bEar"].as<int>();
   bVisor = doc["bVisor"].as<int>();
   rbSpeed = doc["rbSpeed"].as<int>();
@@ -288,6 +308,7 @@ bool saveConfig() {
   doc["speechEna"] = speechEna;
   doc["tiltEna"] = tiltEna;
   doc["bleEna"] = bleEna;
+  doc["oledEna"] = oledEna;
   doc["bEar"] = bEar;
   doc["bVisor"] = bVisor;
   doc["rbSpeed"] = rbSpeed;
@@ -358,6 +379,17 @@ bool isNeutral() {
   }
 }
 
+//--------------------------------//Print centered text to oled buffer
+void displayCenter(String text, uint16_t h) {
+  float width = u8g2.getStrWidth(text.c_str());
+  u8g2.drawStr((128 - width) / 2, h, text.c_str());
+}
+
+//--------------------------------//Float mapping
+float mapfloat(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
 //--------------------------------//WiFi server setup
 void startWiFiWeb() {
   WiFi.softAP(ssid, password);
@@ -384,6 +416,8 @@ void startWiFiWeb() {
       std::istringstream(request->getParam("tiltEna")->value().c_str()) >> std::boolalpha >> tiltEna;
     if(request->hasParam("bleEna"))
       std::istringstream(request->getParam("bleEna")->value().c_str()) >> std::boolalpha >> bleEna;
+    if(request->hasParam("oledEna"))
+      std::istringstream(request->getParam("oledEna")->value().c_str()) >> std::boolalpha >> oledEna;
     if(request->hasParam("bEar"))
       bEar = request->getParam("bEar")->value().toInt();
     if(request->hasParam("bVisor"))
@@ -473,6 +507,27 @@ void startWiFiWeb() {
   server.begin();
 }
 
+//--------------------------------//OLED Init
+void initOled() {
+  Wire.beginTransmission(0x3c); //check for oled on address 0x3c
+  if (Wire.endTransmission() == 0){
+    u8g2.setBusClock(1500000);
+    u8g2.begin();
+    u8g2.setFlipMode(2);
+    u8g2.setFont(u8g2_font_t0_22b_tf);
+    u8g2.drawFrame(14, 36, 100, 9);
+    if (!ina219.begin()) {
+      Serial.println("An Error has occurred while finding INA219 chip!");
+    } else {
+      ina219.setCalibration_16V_8A();
+    }
+    oledInitDone = true;
+  } else {
+    Serial.println("An Error has occurred while initializing SSD1306.");
+    oledEna = false;
+  }
+}
+
 //--------------------------------//Setup
 void setup() {
   Serial.begin(115200);
@@ -503,6 +558,10 @@ void setup() {
       Serial.println("An Error has occurred while starting BLE!");
     }
   }
+
+  if(oledEna) {
+    initOled();
+  }
   
   mx.begin();
   mx.control(MD_MAX72XX::INTENSITY, bVisor);
@@ -522,7 +581,7 @@ String oldanim;
 bool booping = false, wasTilt = false, speechFirst = true, speechResetDone = false, speak = false, boopRea = false;
 float zAx,yAx,finalMicAvg,nvol,micline,avgMicArr[10];
 int randomNum,boopRead, randomTimespan = 0, matrixFix = 7, startIndex = 1, speaking = 0, currentMicAvg = 0;
-unsigned int lastMillsEars = 0, lastMillsVisor = 0, lastMillsTilt = 0, laskSpeakCheck = 0, lastSpeak = 0, lastMillsBoop = 0, lastMillsSpeechAnim = 0, lastFLED = 0;
+unsigned int lastMillsEars = 0, lastMillsVisor = 0, lastMillsTilt = 0, laskSpeakCheck = 0, lastSpeak = 0, lastMillsBoop = 0, lastMillsSpeechAnim = 0, lastFLED = 0, vaStatLast = 0;
 byte row = 0;
 
 void loop() {
@@ -706,12 +765,22 @@ void loop() {
     if(speaking > 4 && !speak) {
       speak = true;
       speechResetDone = false;
+      if(oledEna) {
+        u8g2.drawStr(8, 62, "speak");
+        u8g2.updateDisplayArea(0,6,8,2);
+      }
       Serial.println("Speak");
     }
     if(lastSpeak+500<millis()) {
       if(speak) {
         speak = false;
         speechFirst = true;
+        if(oledEna) {
+          u8g2.setDrawColor(0);
+          u8g2.drawBox(8, 48, 56, 16);
+          u8g2.updateDisplayArea(0,6,8,2);
+          u8g2.setDrawColor(1);
+        }
         Serial.println("unSpeak");
       }
       speaking = 0;
@@ -780,5 +849,30 @@ void loop() {
       Serial.println("unBOOP");
       loadAnim(oldanim,"");
     }
+  }
+
+
+  //--------------------------------//OLED routine
+  if(oledEna && vaStatLast+500<millis() && oledInitDone) {
+    float BusV = ina219.getBusVoltage_V();
+    int barStatus = mapfloat(BusV,5.5,8.42,0,100);
+    if(barStatus > 100) {
+      barStatus = 100;
+    } else if (barStatus < 0) {
+      barStatus = 0;
+    }
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(0, 14, 128, 17);
+    u8g2.setDrawColor(1);
+    displayCenter(String(BusV)+"V "+String(ina219.getCurrent_mA()/1000)+"A",31);
+    u8g2.updateDisplayArea(0,2,16,2);
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(15, 37, 98, 7);
+    u8g2.setDrawColor(1);
+    u8g2.drawBox(14, 36, barStatus, 9);
+    u8g2.updateDisplayArea(1,4,14,2);
+    vaStatLast = millis();
+  } else if (!oledInitDone && oledEna) {
+    initOled();
   }
 }
